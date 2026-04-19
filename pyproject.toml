@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "f1-event-processor"
+version = "0.1.0"
+description = "F1 24 telemetry event processor"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "redis>=5.0.0",
+  "msgpack>=1.0.7",
+  "pydantic>=2.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "fakeredis>=2.23.0",
+  "coverage>=7.5.0",
+  "ruff>=0.4.0",
+  "black>=24.4.0",
+  "mypy>=1.10.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+strict_optional = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = ["src"]

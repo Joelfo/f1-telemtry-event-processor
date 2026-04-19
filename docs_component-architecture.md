@@ -263,263 +263,187 @@ python -m f1_ingestor --bus console --topics car_telemetry --throttle 0.5  # fun
 
 ---
 
-## 1. System Context (What runs where)
+## 7. Event Processor Output Contract (Release 1: Main Player Car Only)
 
-- **F1 24 Game** runs locally and emits telemetry via **UDP**.
-- **Backend service** runs locally:
-  - Listens to UDP packets
-  - Parses packets into typed events
-  - Publishes events to an internal event bus
-  - Maintains a session state snapshot
-  - Streams events/state to browser clients over WebSockets
-- **Frontend dashboard** runs in a browser and connects to the backend over **WebSocket** (and optionally HTTP for initial assets/config).
+This section defines the exact outputs produced by the Event Processor for the first release.
 
----
+### 7.1 Scope and Assumptions
 
-## 2. High-Level Architecture Diagram
+- Scope is restricted to the main player car only.
+- Inputs may still come from multiple topics, but outputs represent only the player car state.
+- Output encoding should match the current pipeline convention: MessagePack with schema versioning.
 
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│                        F1 24 GAME (UDP)                          │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │ UDP packets (binary)
-                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  [1] TELEMETRY INGESTOR                                          │
-│  ┌─────────────────┐    ┌──────────────────────────────────┐    │
-│  │  UDP Listener   │───▶│  Packet Parser / Deserializer    │    │
-│  │  (raw bytes)    │    │  (typed structs per packet type) │    │
-│  └─────────────────┘    └──────────────────────────────────┘    │
-└─────────────────────────────────┬──���────────────────────────────┘
-                                  │ Typed telemetry events
-                                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  [2] IN-PROCESS EVENT BUS (Pub/Sub)                              │
-│      Topics: session, lap_data, car_telemetry, car_status,       │
-│              motion, participants, final_classification, ...     │
-└────────────────┬────────────────────────────────────────────────┘
-                 │ Subscriptions
-        ┌────────┴──────────┐
-        ▼                   ▼
-┌───────────────┐   ┌────────────────────┐
-│  [3a] Event   │   │  [3b] State Store  │
-│  Processors   │   │  (current snapshot │
-│  /Aggregators │   │   of session data) │
-└───────┬───────┘   └────────┬───────────┘
-        └─────────┬──────────┘
-                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  [4] WEBSOCKET GATEWAY                                           │
-│  - Manages browser connections                                   │
-│  - Sends initial snapshot on connect                             │
-│  - Broadcasts updates (optionally throttled)                     │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ WebSocket (ws://)
-                               ▼
-┌─────────────────���───────────────────────────────────────────────┐
-│  [5] FRONTEND DASHBOARD (Browser)                                │
-│  - Real-time UI: gauges, charts, track map, timing, standings    │
-└─────────────────────────────────────────────────────────────────┘
+### 7.2 Output Types
+
+The Event Processor produces three output classes:
+
+1. **Derived events (stream):** higher-level metrics computed from raw telemetry.
+2. **State updates (stream):** partial patches to the latest session snapshot.
+3. **Snapshot (read model):** full in-memory state served to new WebSocket clients.
+
+### 7.3 Redis Channels (Release 1)
+
+| Channel | Purpose | Frequency |
+|---|---|---|
+| `ep.r1.player.derived.lap_metrics` | Timing metrics for current lap and deltas | up to 10 Hz |
+| `ep.r1.player.derived.car_metrics` | Normalized live car metrics (speed, controls, rpm, drs, ers) | up to 20 Hz |
+| `ep.r1.player.derived.tyre_metrics` | Tyre temperatures/wear and short-term trend | up to 5 Hz |
+| `ep.r1.player.state.patch` | Incremental patch updates for snapshot state | up to 20 Hz |
+| `ep.r1.player.meta` | Session lifecycle and processor metadata | event-driven |
+
+Notes:
+- Prefix `ep.r1` identifies Event Processor release 1 contract.
+- The WebSocket Gateway can subscribe to all channels above and rebroadcast as JSON.
+
+### 7.4 Common Envelope (all channels)
+
+Every output message must include the same envelope fields:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `v` | int | yes | Schema version. Release 1 value: `1` |
+| `type` | str | yes | Message type discriminator |
+| `session_uid` | int | yes | Session identifier from telemetry |
+| `overall_frame_identifier` | int | yes | Monotonic frame id for ordering |
+| `ts_monotonic_ns` | int | yes | Local monotonic timestamp in nanoseconds |
+| `player_car_index` | int | yes | Player car index copied from source events |
+| `payload` | map | yes | Type-specific content |
+
+Ordering and reset rules:
+- Always order messages by `overall_frame_identifier`.
+- Ignore out-of-order messages where `overall_frame_identifier` is older than the last processed frame.
+- On `session_uid` change, clear all in-memory state and publish a `session_reset` meta event.
+
+### 7.5 Derived Message Schemas
+
+#### A) `lap_metrics` (`type = "lap_metrics"`)
+
+`payload` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `lap_number` | int | Current lap number |
+| `current_lap_time_ms` | int | Elapsed time in current lap |
+| `last_lap_time_ms` | int\|null | Completed last lap time |
+| `best_lap_time_ms` | int\|null | Best lap in current session |
+| `delta_to_best_ms` | int\|null | `current_lap_time_ms - best_reference_at_same_point` (or null if unavailable) |
+| `delta_to_last_ms` | int\|null | Delta versus previous lap reference |
+| `sector` | int | Current sector (1, 2, 3) |
+| `sector1_time_ms` | int\|null | Sector 1 time when available |
+| `sector2_time_ms` | int\|null | Sector 2 time when available |
+| `pit_status` | str | `none`, `pitting`, `in_pit_area` |
+
+#### B) `car_metrics` (`type = "car_metrics"`)
+
+`payload` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `speed_kph` | int | Vehicle speed |
+| `throttle_pct` | float | `throttle * 100` |
+| `brake_pct` | float | `brake * 100` |
+| `steer_pct` | float | `steer * 100` (signed) |
+| `gear` | int | Current gear |
+| `engine_rpm` | int | Engine RPM |
+| `drs_enabled` | bool | DRS currently active |
+| `ers_store_energy_j` | float | ERS battery energy |
+| `ers_deploy_mode` | int | Game ERS deploy mode enum |
+| `ers_harvest_mguk_j` | float | Current MGU-K harvest |
+| `ers_deployed_this_lap_j` | float | Total ERS deployed this lap |
+
+#### C) `tyre_metrics` (`type = "tyre_metrics"`)
+
+`payload` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `surface_temp_c` | map | `{ "rl": int, "rr": int, "fl": int, "fr": int }` |
+| `inner_temp_c` | map | `{ "rl": int, "rr": int, "fl": int, "fr": int }` |
+| `wear_pct` | map | `{ "rl": int, "rr": int, "fl": int, "fr": int }` |
+| `avg_surface_temp_c` | float | Mean of four corners |
+| `avg_wear_pct` | float | Mean of four corners |
+| `wear_rate_pct_per_min` | float\|null | Rolling rate-of-change over short window |
+
+### 7.6 State Patch Schema (`ep.r1.player.state.patch`)
+
+`type = "state_patch"`
+
+`payload` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `path` | str | Dot path in snapshot (example: `player.car.speed_kph`) |
+| `value` | any | New value to set |
+| `source_type` | str | Producer message type (`car_metrics`, `lap_metrics`, etc.) |
+
+Patch semantics:
+- Each message may include one patch only (simple and explicit for release 1).
+- Consumers apply patches in message order.
+
+### 7.7 Meta Schema (`ep.r1.player.meta`)
+
+`payload` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `event` | str | `session_started`, `session_reset`, `processor_started`, `processor_heartbeat` |
+| `details` | map | Optional metadata for diagnostics |
+
+### 7.8 In-Memory Snapshot Shape (served on WS connect)
+
+Recommended snapshot structure:
+
+```json
+{
+  "v": 1,
+  "session_uid": 123456789,
+  "player_car_index": 0,
+  "updated_at_ns": 0,
+  "player": {
+    "car": {
+      "speed_kph": 0,
+      "throttle_pct": 0,
+      "brake_pct": 0,
+      "steer_pct": 0,
+      "gear": 0,
+      "engine_rpm": 0,
+      "drs_enabled": false,
+      "ers_store_energy_j": 0
+    },
+    "lap": {
+      "lap_number": 0,
+      "current_lap_time_ms": 0,
+      "last_lap_time_ms": null,
+      "best_lap_time_ms": null,
+      "delta_to_best_ms": null,
+      "delta_to_last_ms": null,
+      "sector": 1
+    },
+    "tyres": {
+      "surface_temp_c": { "rl": 0, "rr": 0, "fl": 0, "fr": 0 },
+      "inner_temp_c": { "rl": 0, "rr": 0, "fl": 0, "fr": 0 },
+      "wear_pct": { "rl": 0, "rr": 0, "fl": 0, "fr": 0 },
+      "avg_surface_temp_c": 0,
+      "avg_wear_pct": 0,
+      "wear_rate_pct_per_min": null
+    }
+  }
+}
 ```
 
----
+### 7.9 WebSocket Mapping (for Gateway)
 
-## 3. Components and Responsibilities
+- On connect: emit `snapshot` using the full in-memory snapshot.
+- During session: emit `update` per derived/state/meta message.
+- Message envelope to browser can be:
+  - `category`: `snapshot` | `update` | `meta`
+  - `topic`: channel name
+  - `data`: decoded output payload + envelope metadata
 
-### [1] Telemetry Ingestor
+### 7.10 Release 1 Non-goals
 
-**Responsibility:** Turn raw UDP packets into typed domain events.
-
-**Subcomponents:**
-- **UDP Listener**
-  - Binds to the configured UDP port (commonly `20777`)
-  - Receives datagrams (binary payloads)
-  - Passes raw bytes to parser
-- **Packet Parser / Deserializer**
-  - Reads the packet header first to determine packet type (`packetId`)
-  - Decodes the payload into a typed structure for that packet type
-  - Emits a normalized internal event object
-
-**Inputs:**
-- UDP datagrams (binary)
-
-**Outputs:**
-- `TelemetryEvent` objects published to the Event Bus (topic-based)
-
-**Notes:**
-- Parsing must match the F1 24 UDP spec.
-- Include enough metadata in events to correlate:
-  - timestamp (local monotonic time and/or game session time if available)
-  - packet type
-  - player car index (when relevant)
-  - session identifier fields (when relevant)
+- No multi-car standings model in Event Processor outputs.
+- No historical persistence in Redis (Pub/Sub only).
+- No replay API in this release.
 
 ---
-
-### [2] In-Process Event Bus (Pub/Sub)
-
-**Responsibility:** Decouple producers (ingestor/parser) from consumers (processors, state store, websocket gateway).
-
-**Key properties:**
-- In-memory, single-process pub/sub
-- Topic-based routing, typically aligning with packet types:
-  - `session`
-  - `lap_data`
-  - `car_telemetry`
-  - `car_status`
-  - `motion`
-  - `participants`
-  - `final_classification`
-  - etc.
-
-**Inputs:**
-- Typed telemetry events
-
-**Outputs:**
-- Delivered events to all subscribers of a topic
-
-**Non-goals:**
-- Durable storage (not a persistent queue)
-- Cross-machine distribution
-
----
-
-### [3a] Event Processors / Aggregators
-
-**Responsibility:** Compute derived metrics and higher-level events from raw telemetry.
-
-**Examples of derived outputs:**
-- Lap delta vs. best lap / previous lap
-- Sector time history and trends
-- Tyre temperature/wear trends (rate-of-change)
-- DRS usage timeline
-- Speed trace over last N seconds
-
-**Inputs:**
-- Raw telemetry events from the Event Bus
-
-**Outputs:**
-- Derived events published back to the Event Bus (recommended) and/or updates to State Store
-
-**Design guidance:**
-- Prefer small, composable processors.
-- Each processor should be testable with recorded telemetry replays.
-
----
-
-### [3b] State Store (Session Snapshot Cache)
-
-**Responsibility:** Maintain the latest known values needed to render the dashboard immediately.
-
-**Why this exists:**
-- New browser clients may connect mid-session.
-- They need an initial snapshot instantly (not “wait until the next packet arrives”).
-
-**Inputs:**
-- Subscribes to relevant topics on the Event Bus (raw + derived)
-
-**Outputs:**
-- Read access for the WebSocket Gateway (initial snapshot and/or periodic full sync)
-
-**Data model shape:**
-- A hierarchical object keyed by:
-  - session id / session UID (if available)
-  - packet/topic name
-  - car index / participant id (where applicable)
-- Stores “latest value” + timestamp for each tracked field.
-
----
-
-### [4] WebSocket Gateway
-
-**Responsibility:** Bridge backend events to frontend clients in real time.
-
-**Core behaviors:**
-- Accept WebSocket connections from browsers
-- On client connect:
-  - Send current State Store snapshot (or a subset relevant to the UI)
-- Stream updates:
-  - Subscribe to Event Bus topics and broadcast events to clients
-  - Optionally throttle high-frequency streams (e.g., motion at 60Hz)
-
-**Inputs:**
-- Event Bus subscriptions
-- State Store snapshot reads
-
-**Outputs:**
-- WebSocket messages to connected clients (JSON-serialized)
-
-**Recommended message categories:**
-- `snapshot` (initial full state)
-- `update` (incremental events)
-- `meta` (connection status, version, config)
-
----
-
-### [5] Frontend Dashboard (Browser)
-
-**Responsibility:** Render real-time telemetry and derived insights.
-
-**Core UI panels (suggested):**
-- Car telemetry: speed, throttle, brake, gear, RPM, DRS, ERS
-- Timing: current lap, best lap, delta, sector splits
-- Tyres: temps, wear per corner
-- Track map: car position and trajectory (from motion data)
-- Standings / participants: positions and gaps
-
-**Inputs:**
-- WebSocket messages from the backend
-
-**Outputs:**
-- Interactive dashboard UI in the browser
-
-**Frontend guidance:**
-- Prefer state normalization on the client:
-  - apply `snapshot` then incremental `update` messages
-- Smooth animations and decimation for high-frequency charts.
-
----
-
-## 4. Data Flow (Sequence)
-
-1. Game emits UDP telemetry packet.
-2. UDP Listener receives packet bytes.
-3. Parser decodes header → identifies type → deserializes payload into typed object.
-4. Ingestor publishes `TelemetryEvent` to Event Bus topic (e.g., `car_telemetry`).
-5. Event Bus delivers event to:
-   - State Store (update latest snapshot)
-   - Event Processors (derive metrics, publish derived events)
-   - WebSocket Gateway (broadcast incremental updates)
-6. WebSocket Gateway sends:
-   - `snapshot` on new connection
-   - `update` messages continuously
-7. Frontend renders dashboard, updating panels in real time.
-
----
-
-## 5. Technology Notes (Non-binding)
-
-This architecture works with multiple stacks; choose one and stay consistent.
-
-**Common backend options:**
-- Node.js + TypeScript: UDP (`dgram`), pub/sub (`EventEmitter`), WebSocket (`ws` or Socket.IO)
-- Python: UDP (`socket`), events (lightweight pub/sub), WebSocket (FastAPI + websockets)
-
-**Common frontend options:**
-- React or Svelte + Vite
-- Charts: uPlot (high-performance) or Chart.js
-- Track map: Canvas or D3
-
----
-
-## 6. Extensions / Future Enhancements (Optional)
-
-- **Telemetry recording and replay**
-  - Store raw UDP packets or parsed events to disk
-  - Replay sessions for UI development and regression tests
-- **Config UI**
-  - Toggle topics, sampling rate, and panel visibility
-- **Multi-client support**
-  - Multiple dashboards connected simultaneously
-- **Profiles**
-  - Race vs. Time Trial presets (different panels and update rates)
