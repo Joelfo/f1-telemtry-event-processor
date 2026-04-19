@@ -4,16 +4,51 @@ import argparse
 import asyncio
 import logging
 
+from redis.asyncio import Redis
+
+from ep.bus.redis_publisher import RedisPublisher
+from ep.bus.redis_subscriber import RedisSubscriber
 from ep.config import load_settings
 from ep.logging import configure_logging
+from ep.pipeline.orchestrator import INPUT_CHANNELS, Orchestrator
+from ep.pipeline.router import Router
+from ep.state.session_guard import SessionGuard
+from ep.state.snapshot_store import SnapshotStore
 
 
 logger = logging.getLogger("ep.app")
 
 
 async def run_forever() -> None:
+    settings = load_settings()
+    redis_client = Redis(
+        host=settings.redis_host,
+        port=settings.redis_port,
+        db=settings.redis_db,
+        password=settings.redis_password,
+        decode_responses=False,
+    )
+
+    publisher = RedisPublisher(redis_client)
+
+    def subscriber_factory() -> RedisSubscriber:
+        return RedisSubscriber(redis_client, INPUT_CHANNELS)
+
+    orchestrator = Orchestrator(
+        subscriber_factory=subscriber_factory,
+        publisher=publisher,
+        router=Router(),
+        session_guard=SessionGuard(),
+        snapshot_store=SnapshotStore(),
+        logger=logging.getLogger("ep.orchestrator"),
+        heartbeat_seconds=settings.processor_heartbeat_seconds,
+    )
+
     stop_event = asyncio.Event()
-    await stop_event.wait()
+    try:
+        await orchestrator.run(stop_event=stop_event)
+    finally:
+        await redis_client.aclose()
 
 
 def build_parser() -> argparse.ArgumentParser:
